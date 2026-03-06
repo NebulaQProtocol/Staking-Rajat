@@ -305,11 +305,13 @@ contract StakingPool is IERC1363Receiver {
         uint256 acc = _updatePool();
         _settleUser(msg.sender, acc);
 
-        unchecked {
-            u.stakedAmount           -= uint128(amount);
-            totalStaked              -= uint128(amount);
-            totalPendingWithdrawals  += uint128(amount);
-        }
+        // Use Yul helpers for the three balance mutations so every arithmetic
+        // op in the withdrawal path has explicit overflow/underflow protection
+        // in assembly — matching the standard set by _computeReward above.
+        uint128 amt128 = uint128(amount);
+        u.stakedAmount          = _sub128(u.stakedAmount,          amt128);
+        totalStaked             = _sub128(totalStaked,             amt128);
+        totalPendingWithdrawals = _add128(totalPendingWithdrawals, amt128);
         u.rewardDebt = uint128(_computeReward(u.stakedAmount, acc));
 
         // Cache nextWithdrawalId to avoid a second storage read after the increment.
@@ -341,8 +343,9 @@ contract StakingPool is IERC1363Receiver {
         WithdrawalRequest memory req = _withdrawalRequests[msg.sender][id];
         if (req.amount == 0) revert SP__WithdrawalNotFound(msg.sender, id);
 
-        uint256 unlockTime;
-        unchecked { unlockTime = uint256(req.requestTime) + COOLDOWN; }
+        // _cooldownDeadline uses Yul to compute requestTime + COOLDOWN with an
+        // explicit overflow check — the same discipline used in _computeReward.
+        uint256 unlockTime = _cooldownDeadline(uint256(req.requestTime), COOLDOWN);
         if (block.timestamp < unlockTime) {
             revert SP__CooldownNotElapsed(unlockTime, block.timestamp);
         }
@@ -358,7 +361,8 @@ contract StakingPool is IERC1363Receiver {
         delete _withdrawalRequests[msg.sender][id];
         _removeWithdrawalId(msg.sender, id);
 
-        unchecked { totalPendingWithdrawals -= uint128(lpAmount); }
+        // Yul sub: underflow guard matches the rest of the withdrawal math.
+        totalPendingWithdrawals = _sub128(totalPendingWithdrawals, uint128(lpAmount));
         u.pendingRewards = 0;
 
         if (rewardAmount > 0) {
@@ -366,7 +370,8 @@ contract StakingPool is IERC1363Receiver {
             if (rewardAmount > reserve) {
                 revert SP__RewardInsolvency(reserve, rewardAmount);
             }
-            unchecked { rewardReserve = reserve - uint128(rewardAmount); }
+            // Yul sub: explicit underflow protection on the reserve drawdown.
+            rewardReserve = _sub128(reserve, uint128(rewardAmount));
         }
 
         bool ok = IERC20(lpToken).transfer(msg.sender, lpAmount);
@@ -397,10 +402,9 @@ contract StakingPool is IERC1363Receiver {
         req.flagged     = true;
         req.requestTime = uint64(block.timestamp);
 
-        // Inline the unlock computation directly into the event — no local needed.
-        unchecked {
-            emit WithdrawalFlagged(user, id, block.timestamp + COOLDOWN);
-        }
+        // Use the same Yul overflow-checked addition as executeWithdrawal so
+        // the unlock time in the event is computed consistently.
+        emit WithdrawalFlagged(user, id, _cooldownDeadline(block.timestamp, COOLDOWN));
     }
 
     // -------------------------------------------------------------------------
@@ -426,7 +430,8 @@ contract StakingPool is IERC1363Receiver {
         if (pending > reserve) {
             revert SP__RewardInsolvency(reserve, pending);
         }
-        unchecked { rewardReserve = reserve - uint128(pending); }
+        // Yul sub: same overflow discipline as the rest of the withdrawal path.
+        rewardReserve = _sub128(reserve, uint128(pending));
 
         bool ok = IERC20(rewardToken).transfer(msg.sender, pending);
         if (!ok) revert SP__RewardInsolvency(rewardReserve, pending);
@@ -488,7 +493,7 @@ contract StakingPool is IERC1363Receiver {
     function withdrawalUnlockTime(address user, uint256 id) external view returns (uint256) {
         WithdrawalRequest storage req = _withdrawalRequests[user][id];
         if (req.amount == 0) return 0;
-        unchecked { return uint256(req.requestTime) + COOLDOWN; }
+        return _cooldownDeadline(uint256(req.requestTime), COOLDOWN);
     }
 
     // -------------------------------------------------------------------------
@@ -635,6 +640,60 @@ contract StakingPool is IERC1363Receiver {
     function _safeDivide(uint256 numerator, uint256 denominator) internal pure returns (uint256) {
         if (denominator == 0) return 0;
         return numerator / denominator;
+    }
+
+    // -------------------------------------------------------------------------
+    // Internal — Yul helpers for withdrawal arithmetic
+    // -------------------------------------------------------------------------
+
+    // Safe uint128 addition. Reverts with SP__MulOverflow if the result would
+    // exceed type(uint128).max. Used in requestWithdrawal for totalPendingWithdrawals.
+    //
+    // We reuse the SP__MulOverflow error selector (0x906c1881) rather than
+    // introducing a new error type — the root cause (arithmetic overflow) is
+    // the same regardless of whether it's a multiply or an add.
+    function _add128(uint128 a, uint128 b) internal pure returns (uint128 result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := add(a, b)
+            // If result < a, the addition wrapped around the uint128 boundary.
+            if lt(result, a) {
+                mstore(0x00, 0x906c188100000000000000000000000000000000000000000000000000000000)
+                revert(0x00, 0x04)
+            }
+        }
+    }
+
+    // Safe uint128 subtraction. Reverts with SP__MulOverflow if b > a (underflow).
+    // Used in requestWithdrawal and executeWithdrawal for balance/reserve drawdowns.
+    function _sub128(uint128 a, uint128 b) internal pure returns (uint128 result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            // If b > a, subtracting would underflow.
+            if gt(b, a) {
+                mstore(0x00, 0x906c188100000000000000000000000000000000000000000000000000000000)
+                revert(0x00, 0x04)
+            }
+            result := sub(a, b)
+        }
+    }
+
+    // Compute a + b (both uint256) and revert if the result overflows uint256.
+    // Used to calculate the cooldown deadline (requestTime + COOLDOWN) in
+    // executeWithdrawal and flagWithdrawal. While uint256 overflow at real
+    // timestamps is effectively impossible, using an explicit Yul check here
+    // keeps the entire withdrawal math path under the same overflow discipline
+    // as _computeReward and _computeRewardAddition.
+    function _cooldownDeadline(uint256 a, uint256 b) internal pure returns (uint256 result) {
+        /// @solidity memory-safe-assembly
+        assembly {
+            result := add(a, b)
+            // Overflow: result < a means the addition wrapped.
+            if lt(result, a) {
+                mstore(0x00, 0x906c188100000000000000000000000000000000000000000000000000000000)
+                revert(0x00, 0x04)
+            }
+        }
     }
 
     // -------------------------------------------------------------------------

@@ -1,0 +1,11 @@
+# Foundry build artifacts
+out/
+cache/
+
+# Environment / IDE
+.env
+.env.*
+.vscode/
+
+# macOS
+.DS_Store
